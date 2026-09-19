@@ -39,6 +39,12 @@ CREATE TABLE IF NOT EXISTS requests (
     changed     INTEGER NOT NULL,
     PRIMARY KEY (document_id, request_id)
 );
+
+CREATE TABLE IF NOT EXISTS contracts (
+    document_id TEXT PRIMARY KEY REFERENCES documents(id),
+    schema_json TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
 """
 
 
@@ -183,6 +189,33 @@ def insert_revision(
             now,
         ),
     )
+
+
+# ---------- 契约（JSON Schema 2020-12） ----------
+
+
+def get_contract(conn: sqlite3.Connection, doc_id: str) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM contracts WHERE document_id = ?", (doc_id,)
+    ).fetchone()
+
+
+def upsert_contract(
+    conn: sqlite3.Connection, doc_id: str, schema: Any, now: str
+) -> None:
+    """调用方需已开启写事务，且 *schema* 已通过自检并验证过当前文档。"""
+    conn.execute(
+        "INSERT INTO contracts (document_id, schema_json, updated_at)"
+        " VALUES (?, ?, ?)"
+        " ON CONFLICT(document_id) DO UPDATE SET"
+        "   schema_json = excluded.schema_json, updated_at = excluded.updated_at",
+        (doc_id, canonical(schema), now),
+    )
+
+
+def delete_contract(conn: sqlite3.Connection, doc_id: str) -> None:
+    """调用方需已开启写事务。无契约时为 no-op。"""
+    conn.execute("DELETE FROM contracts WHERE document_id = ?", (doc_id,))
 
 
 def insert_request(

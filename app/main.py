@@ -13,7 +13,8 @@ from fastapi.responses import JSONResponse
 from . import db
 from .config import settings
 from .merge import apply_merge_patch, present_conflict, three_way_merge
-from .schemas import CreateDocument, UpdateDocument
+from .schemas import CreateDocument, SetContract, UpdateDocument
+from .validation import check_schema, validate_instance
 
 
 @asynccontextmanager
@@ -179,6 +180,99 @@ def get_one_revision(
     }
 
 
+# ---------------------------------------------------------------- 契约（JSON Schema 2020-12）
+
+
+@app.put("/documents/{doc_id}/schema", tags=["contracts"])
+def put_contract(
+    doc_id: str,
+    body: SetContract,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> dict[str, Any]:
+    """设置 / 替换文档契约。
+
+    顺序：① 元校验 Schema 本身；② 在同一写事务内校验**当前文档**实例。
+    任一步不通过都返回 422 且**不替换**既有契约（无契约时也不创建）。
+    """
+    doc = db.get_document(conn, doc_id)
+    if doc is None:
+        raise err(status.HTTP_404_NOT_FOUND, "not_found", document_id=doc_id)
+
+    schema = body.schema_
+    schema_errors = check_schema(schema)
+    if schema_errors:
+        raise err(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "invalid_schema",
+            document_id=doc_id,
+            reason="schema 本身不符合 JSON Schema 2020-12",
+            errors=schema_errors,
+        )
+
+    with db.transaction(conn):
+        # 事务内重读当前文档与既有契约：验证与替换原子完成，
+        # 不与并发 PATCH 产生“按旧内容验证、按新内容替换”的窗口。
+        doc = db.get_document(conn, doc_id)
+        current_content = json.loads(
+            db.get_revision(conn, doc_id, doc["current_revision"])["content"]
+        )
+        instance_errors = validate_instance(schema, current_content)
+        if instance_errors:
+            raise err(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "schema_validation_failed",
+                document_id=doc_id,
+                revision=doc["current_revision"],
+                reason="当前文档不满足所给 schema，契约未替换",
+                errors=instance_errors,
+            )
+        now = db.utcnow()
+        db.upsert_contract(conn, doc_id, schema, now)
+
+    return {
+        "document_id": doc_id,
+        "schema": schema,
+        "revision": doc["current_revision"],
+        "updated_at": now,
+    }
+
+
+@app.get("/documents/{doc_id}/schema", tags=["contracts"])
+def get_contract(
+    doc_id: str, conn: sqlite3.Connection = Depends(get_conn)
+) -> dict[str, Any]:
+    doc = db.get_document(conn, doc_id)
+    if doc is None:
+        raise err(status.HTTP_404_NOT_FOUND, "not_found", document_id=doc_id)
+    row = db.get_contract(conn, doc_id)
+    if row is None:
+        raise err(
+            status.HTTP_404_NOT_FOUND,
+            "schema_not_found",
+            document_id=doc_id,
+            reason="该文档未设置契约",
+        )
+    return {
+        "document_id": doc_id,
+        "schema": json.loads(row["schema_json"]),
+        "updated_at": row["updated_at"],
+    }
+
+
+@app.delete("/documents/{doc_id}/schema", tags=["contracts"])
+def delete_contract(
+    doc_id: str, conn: sqlite3.Connection = Depends(get_conn)
+) -> dict[str, Any]:
+    """删除契约；删除后 PATCH 恢复为无契约的原更新行为。幂等。"""
+    doc = db.get_document(conn, doc_id)
+    if doc is None:
+        raise err(status.HTTP_404_NOT_FOUND, "not_found", document_id=doc_id)
+    with db.transaction(conn):
+        existed = db.get_contract(conn, doc_id) is not None
+        db.delete_contract(conn, doc_id)
+    return {"document_id": doc_id, "deleted": existed}
+
+
 # ---------------------------------------------------------------- 更新（三方合并）
 
 
@@ -290,6 +384,23 @@ def update_document(
                     base_revision=body.base_revision,
                     current_revision=current_revision,
                     conflicts=conflicts_out,
+                )
+
+        # 第二步（Merge Patch 与三方重放均完成后）：若文档存在契约，
+        # 校验最终候选内容。失败则事务回滚——不写修订、不占用 request_id。
+        contract_row = db.get_contract(conn, doc_id)
+        if contract_row is not None:
+            contract_schema = json.loads(contract_row["schema_json"])
+            schema_errors = validate_instance(contract_schema, merged)
+            if schema_errors:
+                raise err(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    "schema_validation_failed",
+                    document_id=doc_id,
+                    request_id=body.request_id,
+                    base_revision=body.base_revision,
+                    current_revision=current_revision,
+                    errors=schema_errors,
                 )
 
         changed = db.canonical(merged) != db.canonical(current_content)

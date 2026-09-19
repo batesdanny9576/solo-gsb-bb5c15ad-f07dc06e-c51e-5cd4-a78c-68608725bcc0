@@ -51,3 +51,20 @@ class UpdateDocument(StrictModel):
         if not isinstance(v, _JSON_TYPES):
             raise ValueError("patch 必须是合法的 JSON 值")
         return v
+
+
+class SetContract(StrictModel):
+    # JSON Schema 根必须是对象或布尔（true/false 布尔 Schema）；
+    # 进一步的合法性（关键字、$ref 等）由 validation.check_schema 做元校验。
+    schema_: Any = Field(
+        ...,
+        alias="schema",
+        description="JSON Schema 2020-12 契约（对象或布尔）",
+    )
+
+    @field_validator("schema_")
+    @classmethod
+    def _json_only(cls, v: Any) -> Any:
+        if not isinstance(v, (dict, bool)):
+            raise ValueError("schema 必须是 JSON 对象或布尔值（JSON Schema 2020-12）")
+        return v
