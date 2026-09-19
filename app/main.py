@@ -12,8 +12,9 @@ from fastapi.responses import JSONResponse
 
 from . import db
 from .config import settings
+from .contracts import check_schema, validate
 from .merge import apply_merge_patch, present_conflict, three_way_merge
-from .schemas import CreateDocument, UpdateDocument
+from .schemas import CreateDocument, SetContract, UpdateDocument
 
 
 @asynccontextmanager
@@ -179,6 +180,85 @@ def get_one_revision(
     }
 
 
+# ---------------------------------------------------------------- 契约（JSON Schema 2020-12）
+
+
+def _contract_payload(doc_id: str, row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "document_id": doc_id,
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "schema": json.loads(row["schema"]),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+@app.put("/documents/{doc_id}/schema", tags=["contracts"])
+def put_contract(
+    doc_id: str, body: SetContract, conn: sqlite3.Connection = Depends(get_conn)
+) -> dict[str, Any]:
+    # 第一步：校验 Schema 本身必须是合法的 JSON Schema 2020-12
+    reason = check_schema(body.contract_schema)
+    if reason is not None:
+        raise err(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "invalid_schema",
+            document_id=doc_id,
+            reason=reason,
+        )
+
+    # 第二步：同一事务内验证当前文档，通过才落库（BEGIN IMMEDIATE 取写锁，
+    # 期间的并发 PATCH 会排队，不会出现“验证后内容被改”的窗口）
+    with db.transaction(conn):
+        doc = db.get_document(conn, doc_id)
+        if doc is None:
+            raise err(status.HTTP_404_NOT_FOUND, "not_found", document_id=doc_id)
+        current = db.get_revision(conn, doc_id, doc["current_revision"])
+        errors = validate(body.contract_schema, json.loads(current["content"]))
+        if errors:
+            raise err(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "schema_validation_failed",
+                document_id=doc_id,
+                revision=doc["current_revision"],
+                reason="当前文档不满足契约，契约未生效",
+                errors=errors,
+            )
+        now = db.utcnow()
+        db.upsert_contract(conn, doc_id, body.contract_schema, now)
+        row = db.get_contract(conn, doc_id)
+    return _contract_payload(doc_id, row)
+
+
+@app.get("/documents/{doc_id}/schema", tags=["contracts"])
+def get_contract(
+    doc_id: str, conn: sqlite3.Connection = Depends(get_conn)
+) -> dict[str, Any]:
+    if db.get_document(conn, doc_id) is None:
+        raise err(status.HTTP_404_NOT_FOUND, "not_found", document_id=doc_id)
+    row = db.get_contract(conn, doc_id)
+    if row is None:
+        raise err(
+            status.HTTP_404_NOT_FOUND, "schema_not_found", document_id=doc_id
+        )
+    return _contract_payload(doc_id, row)
+
+
+@app.delete("/documents/{doc_id}/schema", tags=["contracts"])
+def delete_contract(
+    doc_id: str, conn: sqlite3.Connection = Depends(get_conn)
+) -> dict[str, Any]:
+    if db.get_document(conn, doc_id) is None:
+        raise err(status.HTTP_404_NOT_FOUND, "not_found", document_id=doc_id)
+    with db.transaction(conn):
+        if not db.delete_contract(conn, doc_id):
+            raise err(
+                status.HTTP_404_NOT_FOUND, "schema_not_found", document_id=doc_id
+            )
+    # 契约删除后，PATCH 恢复原有无校验的更新行为
+    return {"document_id": doc_id, "deleted": True}
+
+
 # ---------------------------------------------------------------- 更新（三方合并）
 
 
@@ -293,6 +373,22 @@ def update_document(
                 )
 
         changed = db.canonical(merged) != db.canonical(current_content)
+
+        # 契约校验：先完成 Merge Patch 与三方重放，再校验最终候选内容。
+        # 失败则整个事务回滚——不写修订、不占用 request_id。
+        contract = db.get_contract(conn, doc_id)
+        if contract is not None:
+            errors = validate(json.loads(contract["schema"]), merged)
+            if errors:
+                raise err(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    "schema_validation_failed",
+                    document_id=doc_id,
+                    request_id=body.request_id,
+                    revision=current_revision,
+                    errors=errors,
+                )
+
         now = db.utcnow()
         if changed:
             new_revision = current_revision + 1

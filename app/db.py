@@ -39,6 +39,13 @@ CREATE TABLE IF NOT EXISTS requests (
     changed     INTEGER NOT NULL,
     PRIMARY KEY (document_id, request_id)
 );
+
+CREATE TABLE IF NOT EXISTS contracts (
+    document_id TEXT PRIMARY KEY REFERENCES documents(id),
+    schema      TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
 """
 
 
@@ -129,6 +136,12 @@ def get_request(
     ).fetchone()
 
 
+def get_contract(conn: sqlite3.Connection, doc_id: str) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM contracts WHERE document_id = ?", (doc_id,)
+    ).fetchone()
+
+
 # ---------- 写入 ----------
 
 def insert_document(
@@ -198,3 +211,24 @@ def insert_request(
         " VALUES (?, ?, ?, ?, ?)",
         (doc_id, request_id, fingerprint, revision, 1 if changed else 0),
     )
+
+
+def upsert_contract(
+    conn: sqlite3.Connection, doc_id: str, schema: Any, now: str
+) -> None:
+    """调用方需已开启写事务。插入或替换文档的 JSON Schema 契约。"""
+    conn.execute(
+        """INSERT INTO contracts (document_id, schema, created_at, updated_at)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT (document_id)
+           DO UPDATE SET schema = excluded.schema, updated_at = excluded.updated_at""",
+        (doc_id, canonical(schema), now, now),
+    )
+
+
+def delete_contract(conn: sqlite3.Connection, doc_id: str) -> bool:
+    """删除文档契约，返回是否真的删掉了（不存在则为 False）。"""
+    cursor = conn.execute(
+        "DELETE FROM contracts WHERE document_id = ?", (doc_id,)
+    )
+    return cursor.rowcount > 0
